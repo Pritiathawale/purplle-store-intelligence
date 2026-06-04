@@ -1,104 +1,83 @@
-# System Design — Purplle Store Intelligence System
+# Engineering Choices — Purplle Store Intelligence System
 
-## Overview
+## Decision 1: Detection Model — YOLOv8n
 
-An end-to-end pipeline that processes raw CCTV footage from the Brigade Road, Bangalore Purplle store and produces real-time store analytics, footfall metrics, and conversion rate insights.
+**Options considered**: YOLOv8n (nano), YOLOv8m (medium), YOLOv8l (large), RT-DETR, MediaPipe Pose
 
----
+**What AI suggested**: Claude recommended YOLOv8m for better handling of partial occlusion in crowded billing scenarios, citing ~5% mAP improvement over nano on COCO person class.
 
-## Architecture
+**What I chose**: YOLOv8n (nano)
 
-```
-[CCTV Videos (.mp4)]
-        ↓
-[Python AI Service — detector.py]
-  - YOLOv8n person detection
-  - Per-camera event generation
-  - Entry/exit heuristics
-        ↓ POST /api/events (JSON)
-[Java Spring Boot Backend]
-  - REST API layer
-  - Business logic (funnel, conversion, anomaly)
-  - Persistence (PostgreSQL)
-        ↓ GET /api/metrics, /api/funnel, /api/alerts
-[React Dashboard]
-  - Live footfall counter
-  - Conversion rate display
-  - Alerts feed
-  - Hourly heatmap chart
-```
+**Why**: The challenge runs on a student laptop without a GPU. Processing times matter:
+- YOLOv8n: ~80ms/frame on CPU
+- YOLOv8m: ~400ms/frame on CPU
+- YOLOv8l: ~800ms/frame on CPU
+
+At 30fps with FRAME_SKIP=30 (1 sample/sec), a 20-minute clip has ~1200 frames to process.
+- Nano: ~96 seconds per camera = ~6 minutes for 4 cameras
+- Medium: ~480 seconds = ~32 minutes for 4 cameras
+
+For a hackathon submission where I need to demo the full pipeline, nano is the only practical choice. In a production deployment with GPU inference (typical retail CCTV systems use NVIDIA T4), I would upgrade to YOLOv8m or RT-DETR.
+
+**Trade-off accepted**: ~5% lower detection accuracy on partial occlusion. Mitigated by: (1) retail store people counts are low (2-15 persons), so absolute error is small; (2) confidence scores are included in every event — evaluators can see degraded confidence rather than suppressed events.
 
 ---
 
-## Components
+## Decision 2: Event Schema Design
 
-### 1. Python AI Service (`ai-service/detector.py`)
-- **Model**: YOLOv8n (nano) — chosen for speed on CPU hardware without GPU
-- **Input**: One `.mp4` per camera zone, specified via `--camera` argument
-- **Output**: Structured JSON event stream with per-frame people count, entry detection, bounding boxes, and alert classification
-- **Camera zones supported**: `entrance`, `makeup_zone`, `skin_zone`, `billing`, `floor`
-- **Entry counting**: Heuristic-based — count increases at entrance camera are treated as new entries. Acknowledged limitation documented in CHOICES.md.
+**Options considered**:
+1. Minimal schema (just event_type + timestamp + count)
+2. Full schema matching sample_events.jsonl exactly
+3. Extended schema with additional fields (age_pred, gender_pred, group_id)
 
-### 2. Spring Boot Backend (`backend/`)
-- **Framework**: Spring Boot 3, Java 17
-- **Database**: PostgreSQL (via JPA/Hibernate)
-- **Key endpoints**:
-  - `POST /api/events` — ingest detection events from Python service
-  - `GET /api/metrics` — footfall, conversion rate, avg dwell time
-  - `GET /api/funnel` — entry → zone browse → billing → purchase funnel
-  - `GET /api/alerts` — anomaly events (overcrowding, empty store, long queue)
-  - `GET /api/analytics/hourly` — people count aggregated by hour
-  - `GET /api/analytics/salesperson` — sales performance from transaction data
+**What AI suggested**: Claude suggested the extended schema (option 3) matching the full sample_events.jsonl including gender_pred and age_pred from a hypothetical face analysis model.
 
-### 3. React Dashboard (`frontend/`)
-- **Framework**: React 18, Recharts
-- **Features**: Live count cards, hourly bar chart, alert table, conversion rate gauge
+**What I chose**: Option 2 — full schema matching sample_events.jsonl, without the demographic inference fields
+
+**Why**: The videos have full-face blur applied (stated in the problem). Any age/gender prediction on blurred faces would produce meaningless noise with near-random confidence. Including these fields with fabricated values would be dishonest and would fail schema validation if the harness checks confidence calibration. I implemented the fields that can be derived from YOLOv8 detection (bounding box position → zone_hotspot_x/y, detection confidence, person count for queue_depth) and excluded fields that require face analysis.
+
+**Schema decisions**:
+- `event_id`: uuid-v4, generated at emit time — globally unique, enables idempotency
+- `visitor_id`: VIS_{6-char hex} — short enough to read in logs, unique per session
+- `dwell_ms`: tracked in SessionTracker, accumulated from frame sampling intervals
+- `session_seq`: ordinal position within a visitor's session — helps detect Re-ID failures
+- `metadata.queue_depth`: populated only for BILLING_QUEUE_JOIN events
 
 ---
 
-## Data Sources
+## Decision 3: API Backend — Java Spring Boot vs Python FastAPI
 
-| Source | File | Used For |
-|---|---|---|
-| CCTV footage | 5 × .mp4 files | Footfall counting, zone activity |
-| Sales transactions | Brigade_Bangalore_10_April_26.csv | Conversion denominator (24 orders, 21 unique buyers) |
-| Store layout | Brigade_Road_Store_Layout.xlsx | Camera zone identification |
+**Options considered**:
+1. Python FastAPI (problem statement suggested layout uses this)
+2. Java Spring Boot (my primary backend framework)
+3. Node.js Express
 
----
+**What AI suggested**: Claude recommended FastAPI for consistency with the Python detection pipeline, lower deployment complexity (one language), and the scoring harness having "best coverage for FastAPI" (quoted from the problem statement FAQ).
 
-## Key Metric: Conversion Rate
+**What I chose**: Java Spring Boot 3.2.5
 
-```
-Conversion Rate = (Unique Buyers / Total Footfall) × 100
+**Why**: I disagreed with the AI suggestion on this one. My reasoning:
 
-Unique Buyers   = from CSV: 21 unique customer_numbers on April 10, 2026
-Total Footfall  = from CCTV: count of people entering via entrance camera
-```
+1. **Familiarity**: I can debug Spring Boot JPA issues faster than Python SQLAlchemy edge cases. Under time pressure, framework familiarity is more valuable than theoretical consistency.
 
----
+2. **The scoring harness is language-agnostic**: The FAQ explicitly states "Go and Node.js are acceptable." The FastAPI preference is a suggestion, not a requirement. The harness calls REST endpoints — it doesn't care what generated the JSON.
 
-## Event Schema
+3. **JPA type safety**: Spring Data JPA gives compile-time query validation. A typo in a JPQL query fails at startup, not at runtime during evaluation. This matters for a submission I can't iterate on after the deadline.
 
-```json
-{
-  "cameraId": "entrance",
-  "timestamp": "2026-04-10T12:15:00",
-  "peopleCount": 3,
-  "entryCount": 2,
-  "totalEntriesSoFar": 14,
-  "alert": "OVERCROWDING",
-  "detections": [
-    { "bbox": [120.0, 45.0, 280.0, 410.0], "confidence": 0.87 }
-  ]
-}
-```
+**Trade-off accepted**: Two-language codebase (Python for detection, Java for API). Mitigated by clear separation — the Python script only POSTs JSON to an HTTP endpoint. There is no shared code or FFI boundary.
+
+**Where AI was right**: Claude was correct that FastAPI would have been faster to prototype. If I were doing this again with a week of runway, I would use FastAPI for a single-language stack. The Spring Boot choice was pragmatic for the constraint of a 4-day window.
 
 ---
 
-## Deployment
+## Decision 4: Storage — H2 In-Memory vs PostgreSQL
 
-```bash
-docker compose up
-```
+**Options considered**: H2 (in-memory), SQLite (file), Supabase PostgreSQL, local PostgreSQL
 
-Services: `ai-service` (Python), `backend` (Spring Boot + PostgreSQL), `frontend` (React)
+**What I chose**: H2 in-memory as default, Supabase PostgreSQL as configurable option
+
+**Why H2 as default**: The acceptance gate requires `docker compose up` to start the API with no manual steps. If I set PostgreSQL as the default, evaluators need to either have a local PostgreSQL or wait for Supabase to be provisioned. H2 starts instantly inside the JVM with zero configuration. For the 20-minute demo clip scenario, the data volume (a few thousand events) fits easily in memory.
+
+**Why Supabase as option**: For a live demo where data must survive API restarts, Supabase gives a free hosted PostgreSQL. Switch is one `application.properties` change — no code changes needed.
+
+**Limitation**: H2 data is lost on restart. This means re-running detector.py after restarting Spring Boot. Documented in README.

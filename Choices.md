@@ -1,90 +1,106 @@
-# Engineering Choices & Trade-offs — Purplle Store Intelligence System
+# System Design — Purplle Store Intelligence System
+> Tech Challenge 2026 | Brigade Road, Bangalore
 
-## 1. Model Choice: YOLOv8n over larger YOLO variants
+## Architecture Overview
 
-**Decision**: Use YOLOv8 nano (`yolov8n.pt`) instead of YOLOv8m or YOLOv8l.
+```
+Store 1 CCTV (4 cameras)          Store 2 CCTV (4 cameras)
+Zone/Zone/Entry/Billing    ←→     billing/entry1/entry2/zone
+           ↓
+   Python Detection Pipeline (detector.py)
+   YOLOv8n | Session Tracker | Event Emitter
+   Outputs structured JSON events per schema
+           ↓ POST /events/ingest (batch, idempotent)
+   Java Spring Boot API (port 8080)
+   ├── Ingestion layer    (dedup by event_id)
+   ├── Metrics engine     (footfall, conversion, dwell)
+   ├── Funnel logic       (session-based, no double count)
+   ├── Anomaly detection  (queue spike, dead zone, conversion drop)
+   └── Heatmap            (zone frequency, normalised 0-100)
+           ↓
+   React Dashboard (port 3000)
+   Live cards | Hourly chart | Funnel | Zone heatmap | Alert feed
+           ↓
+    Supabase PostgreSQL
+```
 
-**Reasoning**:
-- Challenge runs on laptop hardware without GPU
-- Nano model processes frames at ~15–20 FPS on CPU vs ~1–2 FPS for larger variants
-- For retail store density (typically 2–15 people in frame), nano accuracy is sufficient
-- Larger model would have caused processing timeouts on 5 concurrent video files
+## Components
 
-**Trade-off accepted**: ~5% lower detection accuracy vs nano in crowded scenes. Mitigated by processing at 2 frames/second (FRAME_SKIP=15 at 30fps), which still captures all meaningful in-store events.
+### 1. Detection Pipeline (`ai-service/detector.py`)
+- **Model**: YOLOv8n (nano) — chosen for CPU inference speed
+- **Frame sampling**: Every 30th frame (~1/sec at 30fps). Retail people counts change slowly; 2fps resolution captures all meaningful entry/exit events
+- **Session tracker**: Per-camera visitor session management. Count increases → new ENTRY events with unique visitor_id. Count decreases → EXIT events. 30-second continuous presence → ZONE_DWELL event
+- **Event schema**: Every event has `event_id` (uuid-v4), `visitor_id` (VIS_xxxxx), `dwell_ms`, `confidence`, `session_seq`, `metadata`
+- **Billing zone**: Entry events become `BILLING_QUEUE_JOIN` when queue_depth > 1
+
+### 2. Spring Boot API (`backend/`)
+- **Framework**: Spring Boot 3.2.5, Java 17
+- **Endpoints**: POST /events/ingest, GET /stores/{id}/metrics, GET /stores/{id}/funnel, GET /stores/{id}/heatmap, GET /stores/{id}/anomalies, GET /health
+- **Idempotency**: Deduplication by event_id — same UUID submitted twice is stored once
+- **POS correlation**: Conversion rate uses time-window matching — visitors in billing zone 5 minutes before a POS transaction timestamp = converted visitors
+
+### 3. Database
+- **Default**: H2 in-memory (works without any setup for docker compose)
+- **Production**: Supabase PostgreSQL (switch via application.properties)
+- **Why H2 for default**: No external dependency, zero-config docker setup, evaluators can run docker compose up without database credentials
+
+### 4. React Dashboard (`frontend/`)
+- React 18, Recharts for charts, Axios for API calls
+- Auto-refreshes every 15 seconds
+- Shows: 8 metric cards, hourly people count bar chart, conversion funnel with drop-off %, zone activity grid, anomaly alerts table, live events feed
+
+## Event Schema Design
+
+Events follow the sample_events.jsonl schema exactly:
+```json
+{
+  "event_id":   "uuid-v4",
+  "store_id":   "ST1008",
+  "camera_id":  "CAM_ENTRY",
+  "visitor_id": "VIS_A1B2C3",
+  "event_type": "ENTRY",
+  "timestamp":  "2026-04-10T12:30:00Z",
+  "zone_id":    null,
+  "dwell_ms":   0,
+  "is_staff":   false,
+  "confidence": 0.88,
+  "metadata": {
+    "queue_depth": null,
+    "sku_zone": null,
+    "session_seq": 1
+  }
+}
+```
+
+## Key Business Metric
+
+```
+Conversion Rate = Unique Buyers ÷ Total Footfall × 100
+
+- Footfall: count of ENTRY events from entrance camera (is_staff=false)
+- Unique Buyers: visitors whose visitor_id appeared in billing zone
+  within 5 minutes before a POS transaction timestamp
+- Source: POS CSV (ST1008, 24 transactions, April 10 2026)
+```
+
+## Known Limitations Documented
+
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| No cross-camera Re-ID | Same person at entry + zone gets two visitor_ids | Documented in CHOICES.md; would use torchreid OSNet in production |
+| Staff detection heuristic | is_staff=false for all; staff uniforms not detected | Frame rate and zone patterns could filter staff in production |
+| Re-entry counting | Person who exits and re-enters counted as new visitor | REENTRY event type not implemented — acknowledged trade-off |
+| Frame sampling at 1fps | Fast movements (sprint through door) may be missed | Acceptable for retail context; customers don't sprint |
 
 ---
 
-## 2. Entry Detection: Heuristic vs Centroid Tracking
+## AI-Assisted Decisions
 
-**Decision**: Use count-increase heuristic at entrance camera instead of full centroid tracking with boundary line crossing.
+### Decision 1 — Detection model selection
+I asked Claude to evaluate YOLOv8n vs YOLOv8m vs RT-DETR for person detection on CPU hardware in a retail setting. Claude's recommendation was YOLOv8m for better accuracy on partial occlusion (billing queue scenarios). **I overrode this** and chose YOLOv8n because the challenge runs on a student laptop without GPU. At FRAME_SKIP=30, the bottleneck is not model accuracy but processing speed — nano model processes a frame in ~80ms on CPU vs ~400ms for medium. For a 20-minute clip at 30fps that's the difference between 2 hours and 10 hours of processing time. The accuracy trade-off is acceptable given the evaluation context.
 
-**Reasoning**:
-- Full centroid tracking requires DeepSORT or ByteTrack — additional complexity with diminishing accuracy returns for single-camera retail use
-- Count-increase at the entrance camera (people_count[t] - people_count[t-1] > 0) provides a reasonable footfall estimate without tracking identity
-- This aligns with how most retail footfall sensors (IR beam counters) work in practice
+### Decision 2 — Session tracking approach
+I asked Claude to suggest a visitor tracking approach without GPU. Claude suggested ByteTrack with bounding box trajectory. **I partially overrode this**: I implemented a simpler count-differential tracker (count goes up → new session, count goes down → session closes) rather than full ByteTrack. My reasoning: ByteTrack requires storing per-frame bounding boxes and running the Hungarian algorithm for assignment — significant complexity for a CPU-only pipeline. The count-differential approach produces the same ENTRY/EXIT event count with less code and no additional dependencies. The main thing it cannot do is Re-ID (detecting the same person after re-entry) — I documented this as a known limitation.
 
-**Trade-off accepted**: Over-counts if multiple people enter simultaneously. Under-counts if someone immediately exits and re-enters. Documented for reviewer transparency.
-
-**Production path**: Would implement ByteTrack for ID-persistent tracking + virtual entry/exit line to resolve double-counting.
-
----
-
-## 3. Architecture: Separate Python service vs integrated Java CV
-
-**Decision**: Computer vision runs as an isolated Python script, separate from the Spring Boot backend.
-
-**Reasoning**:
-- YOLOv8 and OpenCV are Python-native; Java CV libraries (JavaCV, DL4J) have limited YOLO support
-- This separation is common in production systems (ML inference service + application backend)
-- Allows independent scaling: CV processing can be run on a GPU node while the API layer runs on standard compute
-
-**Trade-off accepted**: Two-process architecture instead of one monolith. Mitigated by simple REST communication between the services.
-
----
-
-## 4. Re-entry Handling
-
-**Decision**: Acknowledge re-entry as a known limitation; do not implement cross-camera identity tracking.
-
-**Reasoning**:
-- Resolving re-entry requires face recognition or persistent person re-identification across cameras — raises privacy concerns and adds significant complexity
-- For the conversion rate metric, approximate footfall (with potential re-entry inflation) is still directionally useful
-- Industry standard retail footfall counters (Axis, RetailNext) also do not resolve re-entry by default
-
-**Assumption stated**: Each entry event counted is treated as a unique visit for the purpose of this challenge.
-
----
-
-## 5. Database: PostgreSQL over MongoDB
-
-**Decision**: Use PostgreSQL (relational) over a document store.
-
-**Reasoning**:
-- Event data has a well-defined schema that doesn't change per event type
-- Aggregation queries (hourly counts, conversion rate JOIN with sales data) are more natural in SQL
-- Spring Data JPA gives strong typing and query safety without boilerplate
-- The sales transaction CSV data is tabular — natural fit for relational model
-
----
-
-## 6. Staff Detection: Not filtered
-
-**Decision**: No staff exclusion logic implemented.
-
-**Reasoning**:
-- Distinguishing staff from customers requires either badge detection (CV-hard) or a designated staff zone (layout-specific)
-- The Brigade Road store layout shows staff typically near the billing counter — a billing zone camera heuristic could partially exclude them
-- Chosen to document this limitation transparently rather than implement a brittle heuristic
-
-**Impact on metrics**: Footfall numbers will be slightly inflated due to staff movement. Conversion rate will appear slightly lower than actual.
-
----
-
-## 7. Frame Sampling Rate: Every 15th frame
-
-**Decision**: Process 1 frame every 15 frames (approximately 2 frames/second for 30fps video).
-
-**Reasoning**:
-- Person count in a retail store changes slowly — sampling at 2fps captures all meaningful events
-- Reduces processing time by 15x, making it feasible to process 5 video files in reasonable time on CPU
-- Anomaly detection (overcrowding) uses sustained count over multiple frames — a single missed frame doesn't affect alert accuracy
+### Decision 3 — Java Spring Boot vs Python FastAPI
+The problem statement suggests Python FastAPI. I asked Claude to compare FastAPI vs Spring Boot for this use case. Claude recommended FastAPI for consistency with the Python detection pipeline and the scoring harness. **I kept Spring Boot** because it is my strongest backend framework — I can debug it faster, understand the JPA model, and write reliable tests. The scoring harness works with any REST API; the FastAPI preference is not a hard requirement. I noted in CHOICES.md that this is a deliberate trade-off: familiarity over framework alignment.

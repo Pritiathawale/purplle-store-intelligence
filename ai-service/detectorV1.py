@@ -8,10 +8,10 @@ from ultralytics import YOLO
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 CAMERAS = [
-    {"id": "CAM_1", "file": "CAM 1.mp4",  "zone": "makeup_zone"},
-    {"id": "CAM_2", "file": "CAM 2.mp4",  "zone": "skin_zone"},
+    {"id": "CAM_1", "file": "CAM 1.mp4",  "zone": "skin_zone"},
+    {"id": "CAM_2", "file": "CAM 2.mp4",  "zone": "makeup_zone"},
     {"id": "CAM_3", "file": "CAM 3.mp4",  "zone": "entrance"},
-    {"id": "CAM_4", "file": "CAM 4.mp4",  "zone": "floor"},
+    {"id": "CAM_4", "file": "CAM 4.mp4",  "zone": "storage_room"},
     {"id": "CAM_5", "file": "CAM 5.mp4",  "zone": "billing"},
 ]
 
@@ -60,8 +60,8 @@ def get_alert(people_count, zone):
     """Determine alert type based on count and zone."""
     if people_count > OVERCROWD_THRESHOLD:
         return "OVERCROWDING"
-    if zone == "entrance" and people_count == EMPTY_THRESH:
-        return "EMPTY_ENTRANCE"
+    # if zone == "entrance" and people_count == 0:
+        # return "None"
     if zone == "billing" and people_count > BILLING_QUEUE_THRESH:
         return "LONG_QUEUE"
     return None

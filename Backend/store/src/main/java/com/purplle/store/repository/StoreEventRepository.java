@@ -3,44 +3,57 @@ package com.purplle.store.repository;
 import com.purplle.store.model.StoreEvent;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
-
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 public interface StoreEventRepository extends JpaRepository<StoreEvent, Long> {
 
-    // All events for a specific camera
-    List<StoreEvent> findByCameraId(String cameraId);
+    // Deduplication — find by eventId
+    Optional<StoreEvent> findByEventId(String eventId);
 
-    // All events for a specific zone
-    List<StoreEvent> findByZone(String zone);
+    // By store
+    List<StoreEvent> findByStoreId(String storeId);
 
-    // All alert events (non-null alert field)
-    List<StoreEvent> findByAlertIsNotNull();
+    // Entry events (footfall) — exclude staff
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'entry' AND (e.isStaff = false OR e.isStaff IS NULL)")
+    List<StoreEvent> findEntryEvents(@Param("sid") String storeId);
 
-    // All entrance camera events — used for footfall
-    List<StoreEvent> findByZoneOrderByTimestampAsc(String zone);
-    
-    // Max people count across all events — peak occupancy
-    @Query("SELECT MAX(e.peopleCount) FROM StoreEvent e")
-    Integer findMaxPeopleCount();
+    // Exit events
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'exit'")
+    List<StoreEvent> findExitEvents(@Param("sid") String storeId);
 
-    // Average people count — store busy-ness
-    @Query("SELECT AVG(e.peopleCount) FROM StoreEvent e")
-    Double findAvgPeopleCount();
+    // Zone events
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType IN ('zone_entered','zone_exited')")
+    List<StoreEvent> findZoneEvents(@Param("sid") String storeId);
 
-    // Count of overcrowding alerts
-    @Query("SELECT COUNT(e) FROM StoreEvent e WHERE e.alert = 'OVERCROWDING'")
-    Long countOvercrowdingAlerts();
+    // Queue events
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType IN ('queue_completed','queue_abandoned')")
+    List<StoreEvent> findQueueEvents(@Param("sid") String storeId);
 
-   
-    @Query("SELECT SUBSTRING(e.timestamp, 12, 2) as hour, AVG(e.peopleCount) as avg " +
-            "FROM StoreEvent e GROUP BY SUBSTRING(e.timestamp, 12, 2) ORDER BY hour")
-    List<Object[]> findHourlyAveragePeopleCount();
+    // Abandoned queue events
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.abandoned = true")
+    List<StoreEvent> findAbandonedQueue(@Param("sid") String storeId);
 
-    // Per-zone summary
-    @Query("SELECT e.zone, MAX(e.peopleCount), AVG(e.peopleCount), COUNT(e) " +
-            "FROM StoreEvent e GROUP BY e.zone")
-    List<Object[]> findZoneSummary();
+    // Completed queue (converted visitors)
+    @Query("SELECT e FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'queue_completed'")
+    List<StoreEvent> findCompletedQueue(@Param("sid") String storeId);
+
+    // Zone dwell — avg wait per zone
+    @Query("SELECT e.zoneName, AVG(e.waitSeconds) FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'queue_completed' GROUP BY e.zoneName")
+    List<Object[]> findAvgDwellPerZone(@Param("sid") String storeId);
+
+    // Hourly people count for chart
+    @Query("SELECT SUBSTRING(e.timestamp, 12, 2), COUNT(e) FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'entry' GROUP BY SUBSTRING(e.timestamp, 12, 2) ORDER BY 1")
+    List<Object[]> findHourlyEntries(@Param("sid") String storeId);
+
+    // Zone visit frequency
+    @Query("SELECT e.zoneName, e.zoneId, COUNT(e) FROM StoreEvent e WHERE e.storeId = :sid AND e.eventType = 'zone_entered' GROUP BY e.zoneName, e.zoneId")
+    List<Object[]> findZoneVisitFrequency(@Param("sid") String storeId);
+
+    // Last event timestamp (for health/stale feed check)
+    @Query("SELECT MAX(e.timestamp) FROM StoreEvent e WHERE e.storeId = :sid")
+    String findLastEventTimestamp(@Param("sid") String storeId);
 }
